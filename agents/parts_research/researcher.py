@@ -2,19 +2,19 @@ from fastapi import APIRouter, HTTPException, Body
 from fastapi.responses import JSONResponse
 from typing import Dict, List, Any, Optional
 import logging
-import random # For generating placeholder URLs
 import asyncio
 import json
-import httpx # For calling Jina Reader API
+import httpx
 import re
-import urllib.parse # Import urlencode
+import urllib.parse
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-from bs4 import BeautifulSoup # Import BeautifulSoup
+from bs4 import BeautifulSoup
 
-# Still need OpenAI client for the extraction step
+from .rockauto_parser import extract_rockauto_product_links, parse_rockauto_product_page, normalize_part_number
+
 from openai import AsyncOpenAI, APIError, Timeout
 from config import get_settings
-from models.parts_research import PartResearchResult, FoundPartOption # Assuming models exist
+from models.parts_research import PartResearchResult, FoundPartOption
 
 router = APIRouter()
 settings = get_settings()
@@ -28,67 +28,7 @@ except Exception as e:
     async_openai_client = None
     logger.error(f"Failed to initialize AsyncOpenAI client: {e}", exc_info=True)
 
-# --- Google Custom Search Client --- 
-# MOVED CLASS DEFINITION EARLIER
-class GoogleSearchClient:
-    BASE_URL = "https://www.googleapis.com/customsearch/v1"
-
-    def __init__(self, api_key: str, cse_id: str):
-        if not api_key:
-            raise ValueError("Google API key is required.")
-        if not cse_id:
-            raise ValueError("Google Custom Search Engine ID is required.")
-        self.api_key = api_key
-        self.cse_id = cse_id
-        self.client = httpx.AsyncClient()
-        logger.info("GoogleSearchClient initialized.")
-
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), retry=retry_if_exception_type(httpx.RequestError))
-    async def search(self, query: str, num_results: int = 5) -> Dict[str, Any]:
-        params = {
-            'key': self.api_key,
-            'cx': self.cse_id,
-            'q': query,
-            'num': num_results
-        }
-        try:
-            response = await self.client.get(self.BASE_URL, params=params)
-            response.raise_for_status() # Raise HTTPStatusError for bad responses (4xx or 5xx)
-            results = response.json()
-            logger.debug(f"Google Search successful for query '{query}'. Items found: {len(results.get('items', []))}")
-            return results
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                logger.error(f"Google Search Quota Exceeded or Rate Limit Hit for query '{query}'. Status: {e.response.status_code}. Response: {e.response.text[:200]}")
-            else:
-                logger.error(f"Google Search HTTP Error for query '{query}': Status {e.response.status_code}. Response: {e.response.text[:200]}")
-            # Reraise the specific error after logging, or return empty dict?
-            # Returning empty allows workflow to potentially continue with other parts
-            return {}
-        except httpx.RequestError as e:
-            logger.error(f"Google Search Request Error for query '{query}': {e}")
-            # Reraise to allow tenacity to retry
-            raise e
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode JSON response from Google Search for query '{query}': {e}")
-            return {}
-        except Exception as e:
-            logger.exception(f"Unexpected error during Google Search for query '{query}': {e}")
-            return {}
-
-    async def close(self):
-        await self.client.aclose()
-        logger.info("GoogleSearchClient closed.")
-
 # --- Constants --- 
-JINA_READER_BASE_URL = "https://r.jina.ai/"
-JINA_REQUEST_TIMEOUT = 45 # Timeout for Jina Reader call in seconds
-LLM_EXTRACTION_TIMEOUT = 60 # Timeout for LLM extraction call
-LLM_URL_SELECTION_TIMEOUT = 30.0
-LLM_SELECTION_TIMEOUT = 30.0 # seconds for URL selection LLM call
-MAX_URLS_TO_SELECT = 4 # Max URLs LLM should select
-
-# Define standard browser-like headers
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -106,203 +46,6 @@ REQUEST_HEADERS = {
 HTTP_REQUEST_TIMEOUT = 30.0
 
 # --- Helper Functions --- 
-
-def construct_llm_selection_prompt(original_part: Dict[str, Any], search_results: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Constructs the prompt for the LLM to select the best URLs."""
-    
-    part_desc = original_part.get('description', 'N/A')
-    part_num = original_part.get('part_number') or original_part.get('part_number', 'N/A') # Handle potential variations in key naming
-    
-    system_prompt = f"""
-You are an AI assistant specialized in analyzing Google Search results for automotive parts.
-Your goal is to select the most promising URLs that likely lead to a specific product page where the part can be purchased.
-The target part is:
-- Description: '{part_desc}'
-- Part Number: '{part_num}'
-
-Analyze the provided search results (title, link, snippet). Prioritize URLs from known auto parts retailers (e.g., RockAuto, FCP Euro, AutohausAZ, ECS Tuning, AutoZone, Advance Auto Parts, O'Reilly, NAPA, PartsGeek, CarParts.com) or official manufacturer/dealer sites. Avoid forums, informational pages (like Wikipedia), PDF links, news articles, or overly generic category pages unless they seem highly relevant.
-
-From the list below, select up to {MAX_URLS_TO_SELECT} URLs that are most likely to be direct product pages for the target part. Return ONLY a valid JSON list of strings, where each string is a selected URL. Example: ["url1", "url2", "url3"]
-"""
-    
-    results_text = "\n".join([
-        f"- Title: {res['title']}\n  Link: {res['link']}\n  Snippet: {res.get('snippet', 'N/A')[:200]}..." 
-        for res in search_results
-    ])
-    
-    user_prompt = f"""
-Based on the target part details provided in the system prompt, analyze these search results:
-
-{results_text}
-
-Return a JSON list containing up to {MAX_URLS_TO_SELECT} of the best URLs likely leading to a product page for the target part. Respond ONLY with the JSON list.
-"""
-    
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-
-async def call_llm_for_url_selection(original_part: Dict[str, Any], search_results: List[Dict[str, str]]) -> List[str]:
-    """
-    Calls an LLM to analyze search results and select the most promising URLs 
-    that likely lead to product pages for the specified part.
-
-    Args:
-        original_part: Dictionary containing details of the part being searched (description, part_number, etc.).
-        search_results: A list of dictionaries, each containing 'link', 'title', and 'snippet' from a web search.
-
-    Returns:
-        A list of selected URL strings. Returns an empty list if the LLM call fails or returns invalid data.
-    """
-    if not async_openai_client:
-        logger.error("OpenAI client not available for URL selection.")
-        return []
-    if not search_results:
-        logger.warning("No search results provided to LLM for URL selection.")
-        return []
-
-    part_desc = original_part.get('description', 'N/A')
-    logger.info(f"Requesting LLM URL selection for part: '{part_desc}'")
-    
-    messages = construct_llm_selection_prompt(original_part, search_results)
-
-    try:
-        response = await async_openai_client.chat.completions.create(
-            model=settings.OPENAI_MODEL, # Or a potentially faster/cheaper model if sufficient
-            messages=messages,
-            temperature=0.1, # Low temperature for deterministic selection
-            response_format={"type": "json_object"}, # Expecting JSON output
-            timeout=LLM_SELECTION_TIMEOUT
-        )
-        
-        response_content = response.choices[0].message.content
-        if not response_content:
-            logger.warning(f"LLM returned empty response for URL selection for '{part_desc}'.")
-            return []
-            
-        # The response *should* be a JSON object containing a list, like {"selected_urls": ["url1", ...]}
-        # Or potentially just the list itself: ["url1", ...]
-        # We need robust parsing
-        selected_urls = []
-        try:
-            parsed_json = json.loads(response_content)
-            if isinstance(parsed_json, list):
-                selected_urls = [item for item in parsed_json if isinstance(item, str)]
-            elif isinstance(parsed_json, dict):
-                 # Look for a key that might contain the list (flexible)
-                 for key, value in parsed_json.items():
-                     if isinstance(value, list):
-                         selected_urls = [item for item in value if isinstance(item, str)]
-                         break # Take the first list found
-                 if not selected_urls:
-                     logger.warning(f"LLM JSON response for URL selection was a dict, but no list found. Content: {response_content[:500]}")
-            else:
-                logger.warning(f"LLM JSON response for URL selection was not a list or dict: {type(parsed_json)}. Content: {response_content[:500]}")
-
-        except json.JSONDecodeError:
-            logger.error(f"Failed to decode LLM JSON response for URL selection for '{part_desc}'. Content: {response_content[:500]}")
-            # Fallback: try to extract URLs using regex if JSON fails (less reliable)
-            potential_urls = re.findall(r'https?://[^\s"\'<>]+', response_content)
-            if potential_urls:
-                 logger.info(f"Falling back to regex extraction for URLs. Found: {len(potential_urls)}")
-                 selected_urls = potential_urls[:MAX_URLS_TO_SELECT] # Limit results
-            else:
-                 selected_urls = []
-
-
-        # Final validation and limit
-        validated_urls = [url for url in selected_urls if url.startswith('http')]
-        final_selection = validated_urls[:MAX_URLS_TO_SELECT]
-        
-        logger.info(f"LLM successfully selected {len(final_selection)} URLs for '{part_desc}': {final_selection}")
-        return final_selection
-
-    except Exception as e:
-        logger.exception(f"Unexpected error during LLM URL selection for '{part_desc}': {e}")
-        return []
-
-async def get_target_urls_for_part(
-    part_description: str,
-    part_number: Optional[str],
-    vehicle_year: Optional[int],
-    vehicle_make: Optional[str],
-    vehicle_model: Optional[str],
-    google_search_client: GoogleSearchClient, 
-    original_part_details: Dict[str, Any] 
-) -> List[str]:
-    """
-    Uses Google Custom Search.
-    1. Constructs targeted search queries for the top 5 priority sites.
-    2. Constructs one general search query (no site restriction).
-    3. Runs Google Custom Search for the targeted and general queries.
-    4. Combines, deduplicates, and returns the top unique links found.
-    """
-    logger.info(f"Starting Google Search for: '{part_description}' (PN: {part_number})")
-    
-    # --- Construct Base Query --- 
-    base_query_parts = []
-    if vehicle_year and vehicle_make and vehicle_model:
-         base_query_parts.append(f"{vehicle_year} {vehicle_make} {vehicle_model}")
-    if part_description:
-        base_query_parts.append(part_description)
-    if part_number:
-        base_query_parts.append(f'"{part_number}"') # Quote part number
-        
-    base_query = " ".join(base_query_parts)
-    
-    if not base_query:
-        logger.warning("Cannot construct search query - missing description and part number.")
-        return []
-        
-    # --- Construct Targeted Site Queries --- 
-    target_sites = [ # Prioritize reliable sites first
-        "fcpeuro.com",
-        "rockauto.com",
-        "autohausaz.com",
-        "ecstuning.com",
-        "partsgeek.com", 
-    ]
-    site_queries_to_run = [f"{base_query} site:{site}" for site in target_sites]
-    
-    # --- Define All Queries to Run --- 
-    queries_to_run = site_queries_to_run + [base_query] # Add the general query
-    logger.info(f"Running {len(queries_to_run)} Google searches (up to 5 site-specific + 1 general):")
-    # Log first few queries for brevity if list is long
-    for i, q in enumerate(queries_to_run):
-        logger.info(f"  Query {i+1}: {q}")
-    
-    # --- Run Google Searches Concurrently (or sequentially if preferred) ---
-    all_links_found = []
-    search_tasks = []
-    for query in queries_to_run:
-        # Get slightly fewer results per query now that we have more queries
-        search_tasks.append(google_search_client.search(query, num_results=2)) 
-
-    try:
-        search_results_list = await asyncio.gather(*search_tasks)
-    except Exception as e:
-        logger.error(f"Error gathering Google search results: {e}", exc_info=True)
-        search_results_list = [] # Proceed with empty results if gather fails
-
-    for i, search_results in enumerate(search_results_list):
-        query_used = queries_to_run[i]
-        if search_results and search_results.get("items"):
-            logger.info(f"Got {len(search_results['items'])} results for query: '{query_used}'")
-            for item in search_results["items"]:
-                link = item.get("link")
-                if link:
-                    all_links_found.append(link)
-        else:
-             logger.warning(f"No items found in Google Search result for query: '{query_used}'")
-
-    # --- Process aggregated links --- 
-    # Deduplicate while preserving order (important for prioritizing site results)
-    unique_links = list(dict.fromkeys(all_links_found))
-    final_links = unique_links[:MAX_URLS_TO_SELECT] # Limit to max needed
-    
-    logger.info(f"Returning {len(final_links)} potential URLs from {len(queries_to_run)} searches: {final_links}")
-    return final_links
 
 def create_failure_stub(url: str, reason: str, vendor_hint: Optional[str] = None) -> Dict[str, Any]:
     """Creates a standardized dictionary for failed research attempts."""
@@ -360,11 +103,6 @@ async def scrape_with_httpx(url: str, client: httpx.AsyncClient) -> Dict[str, An
         error_message = f"Direct Scrape Unknown Error: {e}"
         logger.exception(f"Unexpected error during direct scrape for {url}: {e}")
         return create_failure_stub(url, error_message)
-
-def normalize_part_number(pn: Optional[str]) -> Optional[str]:
-    """Removes common separators and converts to uppercase for comparison."""
-    if not pn: return None
-    return re.sub(r'[-\s.]', '', str(pn)).upper()
 
 def part_numbers_match(original_pn: Optional[str], extracted_pn: Optional[str]) -> bool:
     """Compares normalized part numbers. Handles None cases."""
@@ -697,8 +435,8 @@ VENDOR_CONFIG = {
     "rockauto.com": {
         "search_url_template": "https://www.rockauto.com/en/partsearch/?partnum={part_number}",
         "search_method": "GET",
-        "product_page_parser": parse_rockauto_product_page, # Link placeholder
-        "search_results_parser": extract_rockauto_product_links # Extracts links
+        "product_page_parser": parse_rockauto_product_page, 
+        "search_results_parser": extract_rockauto_product_links
     },
     # Add other vendors: fcpeuro.com, autohausaz.com, ecstuning.com, partsgeek.com
     "fcpeuro.com": {
@@ -885,10 +623,6 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
     """
     results = []
     
-    # No longer need Google Search Client here
-    # google_search_client = None 
-    # ... (google client init removed) ...
-
     for part in parts_to_research:
         part_description = part.get('description')
         part_number = part.get('part_number') # Original part number
@@ -1003,11 +737,6 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
         
         # Keep delay between PARTS, not vendors
         await asyncio.sleep(2) 
-
-    # No Google client to close anymore
-    # finally:
-    #     if google_search_client:
-    #         await google_search_client.close()
 
     return results
 
