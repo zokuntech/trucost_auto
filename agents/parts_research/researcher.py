@@ -10,7 +10,9 @@ import urllib.parse
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from bs4 import BeautifulSoup
 
-from .rockauto_parser import extract_rockauto_product_links, parse_rockauto_product_page, normalize_part_number
+from .rockauto_parser import extract_rockauto_product_links, parse_rockauto_product_page
+from .utils import normalize_part_number, create_failure_stub
+from .fcpeuro_parser import extract_fcpeuro_product_links, parse_fcpeuro_product_page
 
 from openai import AsyncOpenAI, APIError, Timeout
 from config import get_settings
@@ -46,27 +48,6 @@ REQUEST_HEADERS = {
 HTTP_REQUEST_TIMEOUT = 30.0
 
 # --- Helper Functions --- 
-
-def create_failure_stub(url: str, reason: str, vendor_hint: Optional[str] = None) -> Dict[str, Any]:
-    """Creates a standardized dictionary for failed research attempts."""
-    vendor = vendor_hint or "Unknown"
-    if vendor == "Unknown": # Try to infer if hint not provided
-        if "rockauto.com" in url: vendor = "RockAuto"
-        elif "autozone.com" in url: vendor = "AutoZone"
-        elif "amazon.com" in url: vendor = "Amazon"
-        # Add others...
-        
-    return {
-        "product_name": f"Failed: {reason}",
-        "price": None,
-        "currency": None,
-        "availability": "Unknown (Failed)",
-        "part_number": None,
-        "vendor": vendor,
-        "source_url": url,
-        "status": "failed",
-        "error_reason": reason
-    }
 
 async def scrape_with_httpx(url: str, client: httpx.AsyncClient) -> Dict[str, Any]:
     """Fetches raw HTML content directly using httpx."""
@@ -111,6 +92,8 @@ def part_numbers_match(original_pn: Optional[str], extracted_pn: Optional[str]) 
     
     norm_orig = normalize_part_number(original_pn)
     norm_extr = normalize_part_number(extracted_pn)
+    
+    logger.debug(f"Part number comparison - Original: '{original_pn}' -> '{norm_orig}', Extracted: '{extracted_pn}' -> '{norm_extr}'")
     
     return norm_orig == norm_extr
 
@@ -425,6 +408,185 @@ def parse_rockauto_product_page(html_content: str, url: str) -> Optional[Dict[st
         data['error_reason'] = f"Parsing Exception: {type(e).__name__} - {e}"
         return data
 
+# --- FCP Euro Placeholder Parsers ---
+def extract_fcpeuro_product_links(html_content: str, url: str) -> List[str]:
+    """Parses FCP Euro search results to find product links."""
+    logger.info(f"[FCP Euro] Attempting to extract product links from {url}")
+    if not html_content:
+        logger.warning(f"[FCP Euro] No HTML content provided for link extraction from {url}")
+        return []
+
+    soup = BeautifulSoup(html_content, 'lxml')
+    product_links = []
+    base_url = "https://www.fcpeuro.com"
+
+    # Products are in <div class="grid-x hit" data-href="...">
+    product_divs = soup.find_all('div', class_='hit')
+
+    if not product_divs:
+        logger.warning(f"[FCP Euro] No 'div.hit' elements found on {url}. Link extraction might fail or page structure may have changed.")
+        return []
+
+    for div in product_divs:
+        data_href = div.get('data-href')
+        if data_href:
+            # Ensure the URL is absolute
+            absolute_url = urllib.parse.urljoin(base_url, data_href)
+            product_links.append(absolute_url)
+        else:
+            logger.debug(f"[FCP Euro] Found a 'div.hit' without a 'data-href' attribute on {url}. Skipping.")
+
+    unique_links = list(dict.fromkeys(product_links)) # Deduplicate while preserving order
+    if unique_links:
+        logger.info(f"[FCP Euro] Extracted {len(unique_links)} unique product links from {url}")
+    else:
+        logger.warning(f"[FCP Euro] Link extraction complete, but no product links were found on {url}")
+        
+    return unique_links
+
+def parse_fcpeuro_product_page(html_content: str, url: str) -> Optional[Dict[str, Any]]:
+    """Parses an FCP Euro product page to extract product details."""
+    logger.info(f"[FCP Euro] Attempting to parse product page: {url}")
+    if not html_content:
+        logger.warning(f"[FCP Euro] No HTML content for product page parse: {url}")
+        return create_failure_stub(url, "No HTML Content", "FCP Euro")
+
+    soup = BeautifulSoup(html_content, 'lxml')
+    data = {
+        'status': 'error',
+        'source_url': url,
+        'vendor': 'FCP Euro',
+        'product_name': None,
+        'part_number': None, # This will be the FCP Euro SKU
+        'manufacturer': None,
+        'price': None,
+        'currency': None,
+        'availability': 'Unknown',
+        'image_url': None,
+        'oem_numbers': [],
+        'specifications': {},
+        'error_reason': None
+    }
+
+    try:
+        # Product Name
+        name_tag = soup.find('h1', class_='listing__name')
+        if name_tag: data['product_name'] = name_tag.get_text(strip=True)
+
+        # Price and Currency (from listing__amount)
+        price_container = soup.find('div', class_='listing__amount')
+        if price_container:
+            price_span = price_container.find('span')
+            if price_span:
+                price_text = price_span.get_text(strip=True)
+                price_match = re.search(r'([\$€£]?)([\d,]+\.?\d*)', price_text)
+                if price_match:
+                    try:
+                        data['price'] = float(price_match.group(2).replace(',', ''))
+                        currency_symbol = price_match.group(1)
+                        if currency_symbol == '$': data['currency'] = 'USD'
+                        elif currency_symbol == '€': data['currency'] = 'EUR'
+                        elif currency_symbol == '£': data['currency'] = 'GBP'
+                        else: data['currency'] = 'USD' # Default assumption
+                    except ValueError:
+                        logger.warning(f"[FCP Euro] Could not convert price '{price_match.group(2)}' to float on {url}")
+        
+        # SKU (FCP Euro's part number)
+        sku_div = soup.find('div', class_='listing__sku')
+        if sku_div:
+            sku_span = sku_div.find_all('span')
+            if len(sku_span) > 1: data['part_number'] = sku_span[1].get_text(strip=True)
+
+        # Manufacturer/Brand
+        # Try data-brand attribute first as it's more direct
+        info_row_with_brand = soup.find('div', class_='listing__infoRow', attrs={'data-brand': True})
+        if info_row_with_brand and info_row_with_brand.get('data-brand'):
+            data['manufacturer'] = info_row_with_brand['data-brand']
+        else:
+            brand_div = soup.find('div', class_='listing__brand')
+            if brand_div:
+                brand_img = brand_div.find('img', alt=True)
+                if brand_img: data['manufacturer'] = brand_img['alt']
+
+        # Availability
+        fulfillment_div = soup.find('div', class_='listing__fulfillment')
+        if fulfillment_div:
+            availability_text = fulfillment_div.get_text(strip=True).lower()
+            if "available" in availability_text:
+                data['availability'] = 'Available'
+                desc_div = soup.find('div', class_='listing__fulfillmentDesc')
+                if desc_div:
+                    desc_span = desc_div.find('span')
+                    if desc_span: 
+                        detailed_availability = desc_span.get_text(strip=True)
+                        if detailed_availability: data['availability'] = detailed_availability # e.g. In Stock
+            elif "not available" in availability_text or "sold out" in availability_text: # Check for other terms
+                data['availability'] = 'Not Available' # Or Out of Stock
+        
+        # Image URL
+        img_tag = soup.find('img', class_='listing__mainImage')
+        if img_tag and img_tag.get('src'):
+            img_src = img_tag['src']
+            data['image_url'] = urllib.parse.urljoin(url, img_src) # url is the product page url, which is a good base
+
+        # --- Extended Information (Description Tab) ---
+        description_tab_panel = soup.find('div', id='description', class_='tabs-panel')
+        if description_tab_panel:
+            # OE Numbers
+            oe_numbers_div = description_tab_panel.find('div', class_='extended__oeNumbers')
+            if oe_numbers_div:
+                oe_dd = oe_numbers_div.find('dd')
+                if oe_dd and oe_dd.get_text(strip=True).lower() != 'n/a':
+                    oe_text = oe_dd.get_text(strip=True)
+                    data['oem_numbers'] = [normalize_part_number(pn.strip()) for pn in oe_text.split(',') if pn.strip()]
+            
+            # MFG Numbers (Treat as additional OEM numbers if they are actual part numbers)
+            mfg_numbers_div = description_tab_panel.find('div', class_='extended__mfgNumbers')
+            if mfg_numbers_div:
+                mfg_dd = mfg_numbers_div.find('dd')
+                if mfg_dd and mfg_dd.get_text(strip=True).lower() != 'n/a':
+                    mfg_text = mfg_dd.get_text(strip=True)
+                    # Add these to oem_numbers as well if they are distinct and valid part numbers
+                    for pn_str in mfg_text.split(','):
+                        norm_pn = normalize_part_number(pn_str.strip())
+                        if norm_pn and norm_pn not in data['oem_numbers']:
+                            data['oem_numbers'].append(norm_pn)
+            
+            # Quality (as a specification)
+            details_div = description_tab_panel.find('div', class_='extended__details')
+            if details_div:
+                dt_list = details_div.find_all('dt')
+                for dt in dt_list:
+                    if dt.get_text(strip=True).lower() == 'quality:':
+                        dd = dt.find_next_sibling('dd')
+                        if dd: data['specifications']['Quality'] = dd.get_text(strip=True)
+                        break
+
+        # Clean up empty OEM numbers list if nothing was added
+        if not data['oem_numbers']: data['oem_numbers'] = None # Or keep as empty list based on preference
+        if not data['specifications']: data['specifications'] = None
+
+        # Determine Success (Part Name, SKU, and Price are key)
+        if data['product_name'] and data['part_number'] and data['price'] is not None:
+            data['status'] = 'success'
+            logger.info(f"[FCP Euro] Successfully parsed: {url}. PN={data['part_number']}, Price={data['price']}")
+            data.pop('error_reason', None)
+        else:
+            missing = []
+            if not data['product_name']: missing.append('product_name')
+            if not data['part_number']: missing.append('part_number (SKU)')
+            if data['price'] is None: missing.append('price')
+            data['error_reason'] = f"Missing essential fields: {', '.join(missing)}"
+            logger.warning(f"[FCP Euro] Failed to parse essential info from {url}. Reason: {data['error_reason']}")
+
+        return data
+
+    except Exception as e:
+        logger.exception(f"[FCP Euro] Unexpected error parsing product page {url}: {e}")
+        data['status'] = 'error'
+        data['error_reason'] = f"Parsing Exception: {type(e).__name__} - {str(e)[:100]}"
+        return data
+
 VENDOR_CONFIG = {
     "pelicanparts.com": {
         "search_url_template": "https://www.pelicanparts.com/catalog/SuperCat/{part_number}_catalog.htm", # Might need adjustment
@@ -442,8 +604,8 @@ VENDOR_CONFIG = {
     "fcpeuro.com": {
         "search_url_template": "https://www.fcpeuro.com/products?keywords={part_number}", # Example
         "search_method": "GET",
-        "product_page_parser": None, 
-        "search_results_parser": None
+        "product_page_parser": parse_fcpeuro_product_page, # Updated
+        "search_results_parser": extract_fcpeuro_product_links # Updated
     },
      "autohausaz.com": {
         "search_url_template": "https://www.autohausaz.com/catalog?q={part_number}", # Example
@@ -580,16 +742,39 @@ async def search_and_extract_vendor_data(
                 else:
                      logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list: {type(options_list)}")
                 
-        # --- Logic for OTHER Vendors: Process Only FIRST Link --- 
+        # --- Logic for OTHER Vendors: Process ALL links for FCP Euro as well ---
+        elif vendor == "fcpeuro.com":
+            logger.info(f"[{vendor}] Entering FCP Euro specific block to process {len(product_links)} links.")
+            link_tasks = []
+            for product_url in product_links:
+                link_tasks.append(scrape_and_parse_product_page(
+                    product_url=product_url, vendor=vendor, config=config,
+                    part_description=part_description, part_number=part_number,
+                    http_client=http_client
+                ))
+            
+            logger.debug(f"[{vendor}] Gathering results for {len(link_tasks)} FCP Euro link processing tasks...")
+            results_from_links = await asyncio.gather(*link_tasks)
+            logger.debug(f"[{vendor}] Gathered results from FCP Euro link processing.")
+            
+            for options_list_item in results_from_links: # Each item from gather is a list from scrape_and_parse
+                if isinstance(options_list_item, list):
+                    found_options_list.extend(options_list_item)
+                else:
+                    logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list for an FCP Euro link: {type(options_list_item)}")
         else:
-            logger.info(f"{vendor}: Processing only the first product link: {product_links[0]}")
-            first_product_url = product_links[0]
-            options_from_first_link = await scrape_and_parse_product_page(
-                product_url=first_product_url, vendor=vendor, config=config,
-                part_description=part_description, part_number=part_number,
-                http_client=http_client
-            )
-            found_options_list.extend(options_from_first_link)
+            # Original logic for other vendors: process only the first link
+            if product_links: # Ensure there is at least one link
+                logger.info(f"[{vendor}] Processing only the first product link: {product_links[0]}")
+                first_product_url = product_links[0]
+                options_from_first_link = await scrape_and_parse_product_page(
+                    product_url=first_product_url, vendor=vendor, config=config,
+                    part_description=part_description, part_number=part_number,
+                    http_client=http_client
+                )
+                found_options_list.extend(options_from_first_link)
+            else:
+                logger.warning(f"[{vendor}] Link extractor returned no links, cannot process first link.")
 
         # After processing link(s), if we found options, return them
         if found_options_list:
@@ -713,14 +898,16 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
                     # Add a failure stub for task exceptions
                     all_vendor_options.append(create_failure_stub("N/A", f"Task Exception: {result_or_exc}", vendor_name))
                 elif isinstance(result_or_exc, list):
-                    # Extend the main list ONLY with dictionaries from the returned list
                     valid_items = [item for item in result_or_exc if isinstance(item, dict)]
                     invalid_items = [item for item in result_or_exc if not isinstance(item, dict)]
                     if invalid_items:
                         logger.error(f"Vendor {vendor_name} task returned list containing non-dict items: {invalid_items}. Discarding them.")
+                    
+                    # Enhanced Debug Log
+                    logger.info(f"[WORKFLOW DEBUG] Processing results for vendor: '{vendor_name}'. Result type: {type(result_or_exc)}. Number of items in result_or_exc: {len(result_or_exc) if isinstance(result_or_exc, list) else 'N/A'}. Number of valid_items: {len(valid_items)}. First valid item (if any): {valid_items[0] if valid_items else 'None'}")
+                        
                     all_vendor_options.extend(valid_items)
                 else:
-                    # Handle unexpected return types
                     logger.error(f"Task for vendor {vendor_name} returned unexpected type: {type(result_or_exc)}. Value: {str(result_or_exc)[:200]}")
                     all_vendor_options.append(create_failure_stub("N/A", f"Unexpected task return type: {type(result_or_exc)}", vendor_name))
         except Exception as e:
