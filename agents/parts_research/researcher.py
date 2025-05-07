@@ -178,7 +178,7 @@ async def call_llm_for_extraction_from_content(
             messages=messages,
             temperature=0.0,
             response_format={"type": "json_object"},
-            timeout=LLM_EXTRACTION_TIMEOUT
+            timeout=60
         )
         response_content = response.choices[0].message.content
         # --- ADDED DEBUG LOG --- 
@@ -477,15 +477,16 @@ async def search_and_extract_vendor_data(
 ) -> List[Dict[str, Any]]:
     """
     Handles searching ONE vendor, scraping, and extracting data.
-    Prioritizes extracting product links from search results (if parser exists),
-    then scrapes and parses the first product page.
-    Falls back to LLM on search results page if other methods fail.
+    - For RockAuto: Extracts ALL product links, scrapes EACH product page, 
+                    parses *all options* using parse_rockauto_product_page for EACH page.
+    - For others: Uses product page parser or LLM fallback on first found link or search page.
+    Returns a LIST of found options (dictionaries).
     """
     logger.info(f"--- Processing Vendor: {vendor} for Part: {part.get('description')} (PN: {part.get('part_number')}) ---")
-    found_options = []
+    found_options_list = [] # Accumulates options from all processed links
     part_number = part.get('part_number')
     part_description = part.get('description')
-    original_search_url = "N/A" # Keep track of the initial URL
+    original_search_url = "N/A"
 
     if not part_number:
         logger.warning(f"Skipping vendor {vendor} - Part number missing for {part.get('description')}")
@@ -507,9 +508,12 @@ async def search_and_extract_vendor_data(
         placeholders = re.findall(r'{([^}]+)}', search_url_template)
         final_format_args = {k: format_args[k] for k in placeholders if k in format_args}
         original_search_url = search_url_template.format(**final_format_args)
-
-        logger.info(f"Attempting search on {vendor} using URL: {original_search_url}")
+        # --- Debug Log --- 
+        logger.debug(f"[{vendor}] Attempting initial search scrape: {original_search_url}")
         scrape_result = await scrape_with_httpx(original_search_url, http_client)
+        # --- Debug Log --- 
+        scrape_status = scrape_result.get("status", "error")
+        logger.debug(f"[{vendor}] Initial search scrape status: {scrape_status}")
 
     except KeyError as e:
          logger.error(f"Missing key '{e}' needed for vendor {vendor} URL template: {search_url_template}")
@@ -518,98 +522,142 @@ async def search_and_extract_vendor_data(
          logger.exception(f"Error formatting/scraping initial URL for vendor {vendor}: {e}")
          return [create_failure_stub(original_search_url, f"Initial Scrape/URL Error: {e}", vendor)]
 
-    if scrape_result.get("status") != "success" or not scrape_result.get("content"):
-        logger.warning(f"Failed to scrape initial search URL for {vendor}: {original_search_url}")
-        return [create_failure_stub(original_search_url, f"Failed to scrape vendor search URL ({scrape_result.get('error_reason', 'Unknown')})", vendor)]
+    # Check scrape status *after* try block
+    if scrape_status != "success" or not scrape_result.get("content"):
+        logger.warning(f"[{vendor}] Failed initial search scrape. URL: {original_search_url}. Reason: {scrape_result.get('error_reason', 'Unknown')}")
+        # Return the failure stub contained within scrape_result if scrape failed
+        # Ensure create_failure_stub is used within scrape_with_httpx on failure
+        if isinstance(scrape_result, dict) and scrape_result.get('status') == 'failed':
+             return [scrape_result] # Return the failure stub directly
+        else:
+             # Create a generic one if scrape_result structure is wrong
+             return [create_failure_stub(original_search_url, f"Failed to scrape vendor search URL ({scrape_result.get('error_reason', 'Unknown')})", vendor)]
         
     initial_html_content = scrape_result["content"]
-    actual_initial_url = scrape_result["original_url"] # URL after redirects
+    actual_initial_url = scrape_result["original_url"] 
 
-    # --- Strategy 1: Extract Product Links and Process First One --- 
+    # --- Strategy 1: Extract Product Link(s) and Process --- 
     product_links = []
-    link_extractor = config.get("search_results_parser") # e.g., extract_rockauto_product_links
+    link_extractor = config.get("search_results_parser") 
     
     if link_extractor:
-        logger.debug(f"Attempting to extract product links using {link_extractor.__name__} for {vendor}")
-        try:
+        logger.debug(f"[{vendor}] Attempting link extraction using {link_extractor.__name__}")
+        try: 
             product_links = link_extractor(initial_html_content, actual_initial_url)
-        except Exception as e:
-            logger.error(f"Error executing link extractor for {vendor}: {e}", exc_info=True)
+            # --- Debug Log --- 
+            logger.debug(f"[{vendor}] Link extractor found {len(product_links)} links.")
+            if product_links:
+                 logger.debug(f"[{vendor}] First few extracted links: {product_links[:3]}")
+        except Exception as e: 
+            logger.error(f"[{vendor}] Error executing link extractor: {e}", exc_info=True)
             product_links = []
             
+    # If links found, proceed to process them
     if product_links:
-        logger.info(f"Found {len(product_links)} product links. Processing the first one: {product_links[0]}")
-        first_product_url = product_links[0]
+        logger.info(f"[{vendor}] Link extractor found {len(product_links)} product links. Processing applicable ones.")
         
-        # Scrape the actual product page
-        product_scrape_result = await scrape_with_httpx(first_product_url, http_client)
-        
-        if product_scrape_result.get("status") == "success" and product_scrape_result.get("content"):
-            product_html_content = product_scrape_result["content"]
-            actual_product_url = product_scrape_result["original_url"]
+        # --- RockAuto Specific Logic: Process ALL Links --- 
+        if vendor == "rockauto.com":
+            # --- Debug Log --- 
+            logger.info(f"[{vendor}] Entering RockAuto specific block to process {len(product_links)} links.")
+            link_tasks = []
+            for product_url in product_links:
+                link_tasks.append(scrape_and_parse_product_page(
+                    product_url=product_url, vendor=vendor, config=config,
+                    part_description=part_description, part_number=part_number,
+                    http_client=http_client
+                ))
             
-            # Try vendor-specific product page parser
-            product_page_parser = config.get("product_page_parser") # e.g., parse_rockauto_product_page (placeholder)
-            product_data = None
-            if product_page_parser:
-                logger.debug(f"Attempting static product page parse using {product_page_parser.__name__} for {vendor}.")
-                try:
-                    product_data = product_page_parser(product_html_content, actual_product_url)
-                except Exception as e:
-                    logger.error(f"Error executing product page parser for {vendor} on {actual_product_url}: {e}", exc_info=True)
-                    product_data = None
+            # --- Debug Log --- 
+            logger.debug(f"[{vendor}] Gathering results for {len(link_tasks)} link processing tasks...")
+            results_from_links = await asyncio.gather(*link_tasks) # No return_exceptions needed here, helper handles errors
+            logger.debug(f"[{vendor}] Gathered results from link processing.")
             
-            # If product parser failed or doesn't exist, use LLM on product page
-            if not product_data:
-                 logger.info(f"Static product page parse failed or N/A for {vendor}. Using LLM on product page: {actual_product_url}")
-                 product_data = await call_llm_for_extraction_from_content(
-                     page_content=product_html_content, 
-                     url=actual_product_url,
-                     original_description=part_description,
-                     original_part_number=part_number
-                 )
-            
-            # Add the result (success or failure stub from parser/LLM)
-            if product_data:
-                 if not product_data.get("vendor"): product_data["vendor"] = vendor.split('.')[0].capitalize()
-                 product_data["source_url"] = actual_product_url # Use the product page URL
-                 found_options.append(product_data)
-                 # Successfully processed the first product link, we can stop here for this vendor
-                 logger.info(f"Finished processing vendor {vendor} after parsing product page.")
-                 return found_options
+            # Flatten results (ensure helper returns list)
+            for options_list in results_from_links: 
+                if isinstance(options_list, list):
+                     found_options_list.extend(options_list)
+                else:
+                     logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list: {type(options_list)}")
+                
+        # --- Logic for OTHER Vendors: Process Only FIRST Link --- 
         else:
-            # Failed to scrape the product page itself
-             logger.warning(f"Failed to scrape product page link {first_product_url} for {vendor}. Reason: {product_scrape_result.get('error_reason', 'Unknown')}")
-             # Add a failure stub for this attempt
-             found_options.append(create_failure_stub(first_product_url, f"Failed to scrape product page ({product_scrape_result.get('error_reason', 'Unknown')})", vendor))
-             # Continue to LLM fallback on search results page below
+            logger.info(f"{vendor}: Processing only the first product link: {product_links[0]}")
+            first_product_url = product_links[0]
+            options_from_first_link = await scrape_and_parse_product_page(
+                product_url=first_product_url, vendor=vendor, config=config,
+                part_description=part_description, part_number=part_number,
+                http_client=http_client
+            )
+            found_options_list.extend(options_from_first_link)
+
+        # After processing link(s), if we found options, return them
+        if found_options_list:
+            logger.info(f"Finished processing vendor {vendor} via product link(s). Returning {len(found_options_list)} options/stubs.")
+            return found_options_list
+        else:
+             logger.warning(f"Processed product links for {vendor}, but no valid options/stubs were generated.")
+             found_options_list.append(create_failure_stub(actual_initial_url, "Product link(s) found, but processing/parsing failed for all.", vendor))
+             return found_options_list
 
     # --- Strategy 2: Fallback to LLM on original search results page --- 
-    # This runs if: 
-    #   - No link extractor exists for the vendor OR
-    #   - Link extractor failed to find links OR
-    #   - Scraping the first product link failed
-    if not found_options: # Only run if we haven't already added an option
-        logger.info(f"Product link processing failed or N/A for {vendor}. Falling back to LLM extraction on initial search page: {actual_initial_url}")
+    else: # No product links found by extractor (or no extractor defined)
+        logger.info(f"[{vendor}] No product links found or extractor not defined. Falling back to LLM on search page: {actual_initial_url}")
         llm_fallback_data = await call_llm_for_extraction_from_content(
-            page_content=initial_html_content, 
-            url=actual_initial_url,
-            original_description=part_description,
-            original_part_number=part_number
+            page_content=initial_html_content, url=actual_initial_url,
+            original_description=part_description, original_part_number=part_number
         )
-        
-        if llm_fallback_data: # Could be success or failure stub
+        if llm_fallback_data:
              if not llm_fallback_data.get("vendor"): llm_fallback_data["vendor"] = vendor.split('.')[0].capitalize()
-             llm_fallback_data["source_url"] = actual_initial_url # URL of the search page
-             found_options.append(llm_fallback_data)
-        else: 
-             # If even LLM fallback returns nothing (shouldn't happen with stubs)
-             logger.error(f"LLM fallback on search page returned None for {vendor}. Creating generic failure.")
-             found_options.append(create_failure_stub(actual_initial_url, "All parsing/extraction failed", vendor))
+             llm_fallback_data["source_url"] = actual_initial_url
+             found_options_list.append(llm_fallback_data)
+        else:
+             found_options_list.append(create_failure_stub(actual_initial_url, "Link extraction failed AND LLM fallback failed", vendor))
 
-    logger.info(f"Finished processing vendor {vendor}. Found {len(found_options)} option(s).")
-    return found_options
+    logger.info(f"[{vendor}] Finished processing. Found {len(found_options_list)} total option(s)/stub(s).")
+    return found_options_list
 
+# --- NEW HELPER FUNCTION for processing a single product page --- 
+async def scrape_and_parse_product_page(
+    product_url: str, vendor: str, config: Dict[str, Any],
+    part_description: Optional[str], part_number: Optional[str],
+    http_client: httpx.AsyncClient
+) -> List[Dict[str, Any]]:
+    """Helper function to scrape and parse a single product page URL."""
+    options_found = [] 
+    product_scrape_result = await scrape_with_httpx(product_url, http_client)
+    if product_scrape_result.get("status") == "success" and product_scrape_result.get("content"):
+        product_html_content = product_scrape_result["content"]
+        actual_product_url = product_scrape_result["original_url"]
+        product_page_parser = config.get("product_page_parser")
+        parsed_data_list = [] 
+        if product_page_parser:
+            logger.debug(f"Attempting static parse using {product_page_parser.__name__} for {vendor} on URL: {actual_product_url}")
+            try:
+                parsed_data_item = product_page_parser(product_html_content, actual_product_url) 
+                if parsed_data_item: 
+                    logger.info(f"Parser {product_page_parser.__name__} returned data with {len(parsed_data_item)} keys for {actual_product_url}")
+                    options_found.append(parsed_data_item) 
+                else: 
+                    logger.warning(f"Parser {product_page_parser.__name__} returned no options for {actual_product_url}")
+            except Exception as e: 
+                logger.error(f"Error executing parser {product_page_parser.__name__} for {vendor} on {actual_product_url}: {e}", exc_info=True)
+        
+        if not options_found: # Use LLM only if static parser failed/didn't exist/returned empty
+             logger.info(f"Static parse failed/N/A for {vendor} on {actual_product_url}. Using LLM.")
+             llm_product_data = await call_llm_for_extraction_from_content(
+                 page_content=product_html_content, url=actual_product_url,
+                 original_description=part_description, original_part_number=part_number
+             )
+             if llm_product_data:
+                  if not llm_product_data.get("vendor"): llm_product_data["vendor"] = vendor.split('.')[0].capitalize()
+                  llm_product_data["source_url"] = actual_product_url
+                  options_found.append(llm_product_data)
+             else:
+                  options_found.append(create_failure_stub(actual_product_url, "Static parse and LLM extraction failed on product page", vendor))
+    else:
+         options_found.append(create_failure_stub(product_url, f"Failed to scrape product page ({product_scrape_result.get('error_reason', 'Unknown')})", vendor))
+    return options_found
 
 # --- Main Workflow Function (Refactored) --- 
 
@@ -644,99 +692,115 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
             continue
 
         logger.info(f"--- Starting research for: '{part_description}' (PN: {part_number}) ---")
+        all_vendor_options = [] # Reset for each part
+        potential_urls_list = [] # Reset for each part
         
-        all_vendor_options = []
-        potential_urls_list = [] # Keep track of URLs we actually attempted to scrape/process
-
-        # Iterate through configured vendors
+        # Create vendor tasks
         vendor_tasks = []
         for vendor, config in VENDOR_CONFIG.items():
-             # Create concurrent tasks for each vendor search/extraction
-             vendor_tasks.append(
-                 search_and_extract_vendor_data(
-                     vendor=vendor, 
-                     config=config, 
-                     part=part, 
-                     vehicle_info=vehicle_info, 
-                     http_client=http_client
-                 )
-             )
+            vendor_tasks.append(search_and_extract_vendor_data(
+                vendor=vendor, config=config, part=part, 
+                vehicle_info=vehicle_info, http_client=http_client
+            ))
              
-        # Run vendor processing concurrently
+        # Run vendor tasks and process results robustly
         try:
-            list_of_vendor_results = await asyncio.gather(*vendor_tasks)
-            # Flatten the list of lists
-            for vendor_result_list in list_of_vendor_results:
-                all_vendor_options.extend(vendor_result_list)
-                # Add the source URLs from successful results to our attempted list
-                for option in vendor_result_list:
-                    if option.get('source_url') and option['source_url'] != "N/A":
-                        potential_urls_list.append(option['source_url'])
-                        
+            task_results_or_exceptions = await asyncio.gather(*vendor_tasks, return_exceptions=True)
+            for i, result_or_exc in enumerate(task_results_or_exceptions):
+                vendor_name = list(VENDOR_CONFIG.keys())[i]
+                if isinstance(result_or_exc, Exception):
+                    logger.error(f"Task for vendor {vendor_name} failed with exception: {result_or_exc}", exc_info=result_or_exc)
+                    # Add a failure stub for task exceptions
+                    all_vendor_options.append(create_failure_stub("N/A", f"Task Exception: {result_or_exc}", vendor_name))
+                elif isinstance(result_or_exc, list):
+                    # Extend the main list ONLY with dictionaries from the returned list
+                    valid_items = [item for item in result_or_exc if isinstance(item, dict)]
+                    invalid_items = [item for item in result_or_exc if not isinstance(item, dict)]
+                    if invalid_items:
+                        logger.error(f"Vendor {vendor_name} task returned list containing non-dict items: {invalid_items}. Discarding them.")
+                    all_vendor_options.extend(valid_items)
+                else:
+                    # Handle unexpected return types
+                    logger.error(f"Task for vendor {vendor_name} returned unexpected type: {type(result_or_exc)}. Value: {str(result_or_exc)[:200]}")
+                    all_vendor_options.append(create_failure_stub("N/A", f"Unexpected task return type: {type(result_or_exc)}", vendor_name))
         except Exception as e:
-            logger.error(f"Error gathering vendor search results for part '{part_description}': {e}", exc_info=True)
-            # Continue processing with potentially partial results if some vendors failed
+            logger.error(f"Error during asyncio.gather for part '{part_description}': {e}", exc_info=True)
+            # Add a general failure? Maybe not needed if individual task failures are logged.
 
-        # Deduplicate potential URLs list
+        # --- Process URLs --- (Operates on the now validated all_vendor_options)
+        potential_urls_list = []
+        for option in all_vendor_options: 
+            # Should be safe now, but double-check doesn't hurt
+            if isinstance(option, dict) and option.get('source_url') and option.get('source_url') != "N/A":
+                potential_urls_list.append(option.get('source_url'))
         potential_urls_list = list(dict.fromkeys(potential_urls_list))
 
-        # Post-process results: Validate Part Number and Calculate Price Difference
-        final_options = []
+        # --- Post-process results: Validate Part Number etc. --- 
+        final_options_by_vendor = {} # Initialize as a dictionary
         for option in all_vendor_options:
-            if option.get('status') == 'success':
+             # Ensure it's a dictionary before processing
+             if not isinstance(option, dict):
+                 logger.error(f"[POST-PROCESS] Skipping non-dict item found in all_vendor_options: {type(option)} - {str(option)[:100]}")
+                 continue 
+            
+             vendor_name = option.get('vendor')
+             if not vendor_name:
+                 logger.warning(f"Option from {option.get('source_url', 'Unknown URL')} is missing vendor name, defaulting to 'Unknown'. Option: {str(option)[:100]}")
+                 vendor_name = "Unknown" # Fallback vendor name
+
+             if option.get('status') == 'success':
                 extracted_pn = option.get('part_number')
-                extracted_oem_list = option.get('oem_numbers') # This is now a list of normalized strings
-                
-                # --- Part Number Validation (Modified) --- 
-                validated = True # Assume valid initially
+                extracted_oem_list = option.get('oem_numbers')
+                validated = True
                 if part_number and extracted_pn:
-                     # Primary Check: Direct Match
                      if not part_numbers_match(part_number, extracted_pn):
-                         # Secondary Check: Original PN in Extracted OEM List?
                          normalized_original_pn = normalize_part_number(part_number)
                          if isinstance(extracted_oem_list, list) and normalized_original_pn in extracted_oem_list:
-                              logger.info(f"Primary PN mismatch for '{part_description}' from {option.get('vendor', 'Unknown')}, but original PN '{part_number}' found in extracted OEM list ({extracted_oem_list}). Accepting option.")
-                              # validated remains True
+                              logger.info(f"Primary PN mismatch for '{part_description}' from {vendor_name}, but original PN '{part_number}' found in extracted OEM list ({extracted_oem_list}). Accepting option.")
                          else:
-                              logger.warning(f"Part number mismatch for '{part_description}' from {option.get('vendor', 'Unknown')}. Original: '{part_number}', Extracted: '{extracted_pn}'. Extracted OEMs: {extracted_oem_list}. Discarding option.")
-                              validated = False # Discard
+                              logger.warning(f"Part number mismatch for '{part_description}' from {vendor_name}. Original: '{part_number}', Extracted: '{extracted_pn}'. Extracted OEMs: {extracted_oem_list}. Discarding option.")
+                              validated = False 
                 elif part_number and not extracted_pn:
-                     logger.debug(f"Could not extract primary part number from {option.get('vendor', 'Unknown')} ({option.get('source_url')}) for validation against original PN '{part_number}'. Keeping option for now, but validation is incomplete.")
-                     # validated remains True, but maybe flag as needs review?
-                # No need for 'elif not part_number:' case as we check for part_number earlier
-
-                # Discard if validation failed
+                     logger.debug(f"Could not extract primary part number from {vendor_name} ({option.get('source_url')}) for validation against original PN '{part_number}'. Keeping option for now, but validation is incomplete.")
+                
                 if not validated:
                      continue 
 
-                # --- Price Comparison --- 
                 found_price = option.get('price')
                 option['price_comparison_status'] = "unknown"
                 option['price_difference'] = None
                 if isinstance(found_price, (int, float)) and isinstance(original_price, (int, float)):
                     difference = round(found_price - original_price, 2)
                     option['price_difference'] = difference
-                    if difference < 0:
-                        option['price_comparison_status'] = "cheaper"
-                    elif difference > 0:
-                        option['price_comparison_status'] = "more_expensive"
-                    else:
-                        option['price_comparison_status'] = "same_price"
-            # Keep failure stubs as well
-            final_options.append(option)
+                    if difference < 0: option['price_comparison_status'] = "cheaper"
+                    elif difference > 0: option['price_comparison_status'] = "more_expensive"
+                    else: option['price_comparison_status'] = "same_price"
+            
+             if vendor_name not in final_options_by_vendor:
+                 final_options_by_vendor[vendor_name] = []
+             final_options_by_vendor[vendor_name].append(option)
 
-        # Sort successful options by price (cheapest first), keep failures at the end
-        final_options.sort(key=lambda x: (x.get('status') != 'success', x.get('price') if isinstance(x.get('price'), (int, float)) else float('inf'))) 
-
+        # Sort options within each vendor's list
+        for vendor_key in final_options_by_vendor:
+            final_options_by_vendor[vendor_key].sort(key=lambda x: (
+                x.get('status') != 'success', 
+                x.get('price') if isinstance(x.get('price'), (int, float)) else float('inf')
+            ))
+        
+        # Append results for this part
         results.append({
             "original_part": part,
-            "potential_urls_attempted": potential_urls_list, # URLs actually processed
-            "found_options": final_options
+            "potential_urls_attempted": potential_urls_list, 
+            "found_options": final_options_by_vendor # Use the new dictionary structure
         })
-        logger.info(f"--- Finished research for: '{part_description}'. Found {len([opt for opt in final_options if opt.get('status') == 'success'])} valid options across {len(VENDOR_CONFIG)} vendors. ---")
         
-        # Keep delay between PARTS, not vendors
-        await asyncio.sleep(2) 
+        total_successful_options = sum(
+            1 for options_list in final_options_by_vendor.values() 
+            for opt in options_list 
+            if isinstance(opt, dict) and opt.get('status') == 'success'
+        )
+        logger.info(f"--- Finished research for: '{part_description}'. Found {total_successful_options} valid options, organized by {len(final_options_by_vendor)} vendors. ---")
+        await asyncio.sleep(2)
 
     return results
 
