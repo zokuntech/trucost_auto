@@ -186,6 +186,236 @@ async def call_llm_for_extraction_from_content(
         logger.exception(f"LLM extraction call failed for {url}: {e}")
         return create_failure_stub(url, error_message)
 
+# --- AutohausAZ Parsers ---
+def extract_autohausaz_product_links(html_content: str, url: str) -> List[str]:
+    """Parses AutohausAZ search results to find product links."""
+    logger.info(f"[AutohausAZ] Attempting to extract product links from {url}")
+    if not html_content:
+        logger.warning(f"[AutohausAZ] No HTML content provided for link extraction from {url}")
+        return []
+
+    soup = BeautifulSoup(html_content, 'lxml')
+    product_links = []
+    base_url = "https://www.autohausaz.com"
+
+    # Look for product containers with class "div-part"
+    product_items = soup.find_all('div', class_='div-part')
+    
+    if not product_items:
+        # Fallback: look for links in the name div
+        name_divs = soup.find_all('div', class_='name')
+        for name_div in name_divs:
+            link = name_div.find('a', href=True)
+            if link and link.get('href'):
+                href = link['href']
+                absolute_url = urllib.parse.urljoin(base_url, href)
+                product_links.append(absolute_url)
+
+    for item in product_items:
+        # Look for the product link in the name div
+        name_div = item.find('div', class_='name')
+        if name_div:
+            link = name_div.find('a', href=True)
+            if link and link.get('href'):
+                href = link['href']
+                absolute_url = urllib.parse.urljoin(base_url, href)
+                product_links.append(absolute_url)
+
+    unique_links = list(dict.fromkeys(product_links))
+    if unique_links:
+        logger.info(f"[AutohausAZ] Extracted {len(unique_links)} unique product links from {url}")
+        logger.debug(f"[AutohausAZ] First few links: {unique_links[:3]}")
+    else:
+        logger.warning(f"[AutohausAZ] No product links found on {url}. HTML structure may have changed.")
+        # Log a sample of the HTML for debugging
+        logger.debug(f"[AutohausAZ] Sample HTML structure: {str(soup)[:1000]}")
+        
+    return unique_links
+
+def parse_autohausaz_product_page(html_content: str, url: str) -> Optional[Dict[str, Any]]:
+    """Parses an AutohausAZ product page to extract product details."""
+    logger.info(f"[AutohausAZ] Attempting to parse product page: {url}")
+    if not html_content:
+        logger.warning(f"[AutohausAZ] No HTML content for product page parse: {url}")
+        return create_failure_stub(url, "No HTML Content", "AutohausAZ")
+
+    soup = BeautifulSoup(html_content, 'lxml')
+    data = {
+        'status': 'error',
+        'source_url': url,
+        'vendor': 'AutohausAZ',
+        'product_name': None,
+        'part_number': None,
+        'manufacturer': None,
+        'price': None,
+        'currency': None,
+        'availability': 'Unknown',
+        'image_url': None,
+        'oem_numbers': [],
+        'specifications': {},
+        'error_reason': None
+    }
+
+    try:
+        # Look for the main product detail container
+        part_detail = soup.find('div', id='partdetail')
+        if not part_detail:
+            # If not found, work with the whole soup
+            part_detail = soup
+
+        # Product Name and Part Number - from the h1 tag
+        h1_tag = part_detail.find('h1')
+        if h1_tag:
+            full_title = h1_tag.get_text(strip=True)
+            # Format: "Genuine Mercedes Valve Cover Gasket; Left | 1130160221"
+            if '|' in full_title:
+                product_name_part = full_title.split('|')[0].strip()
+                part_number_part = full_title.split('|')[1].strip()
+                data['product_name'] = product_name_part
+                data['part_number'] = part_number_part
+            else:
+                data['product_name'] = full_title
+
+        # Price - from the div-part-price section
+        price_div = part_detail.find('div', class_='div-part-price')
+        if price_div:
+            # Look for sale price first
+            sale_price_div = price_div.find('div', class_='saleprice')
+            if sale_price_div:
+                price_span = sale_price_div.find('div', class_='price')
+                if price_span:
+                    price_text = price_span.get_text(strip=True)
+                    price_match = re.search(r'\$?([\d,]+\.?\d*)', price_text)
+                    if price_match:
+                        try:
+                            data['price'] = float(price_match.group(1).replace(',', ''))
+                            data['currency'] = 'USD'
+                        except ValueError:
+                            logger.warning(f"[AutohausAZ] Could not convert price '{price_match.group(1)}' to float on {url}")
+            
+            # If no sale price, look for regular price
+            if data['price'] is None:
+                reg_price_div = price_div.find('div', class_='regprice')
+                if reg_price_div:
+                    price_span = reg_price_div.find('div', class_='price')
+                    if price_span:
+                        price_text = price_span.get_text(strip=True)
+                        price_match = re.search(r'\$?([\d,]+\.?\d*)', price_text)
+                        if price_match:
+                            try:
+                                data['price'] = float(price_match.group(1).replace(',', ''))
+                                data['currency'] = 'USD'
+                            except ValueError:
+                                logger.warning(f"[AutohausAZ] Could not convert price '{price_match.group(1)}' to float on {url}")
+
+        # Availability - from the div-stock-availability section
+        availability_div = part_detail.find('div', class_='div-stock-availability')
+        if availability_div:
+            availability_msg = availability_div.find('div', class_='availability-message')
+            if availability_msg:
+                availability_text = availability_msg.get_text(strip=True)
+                data['availability'] = availability_text
+                # Check for specific availability states
+                if "ships" in availability_text.lower() or "available" in availability_text.lower():
+                    data['availability'] = 'Available'
+                elif "out of stock" in availability_text.lower() or "unavailable" in availability_text.lower():
+                    data['availability'] = 'Not Available'
+
+        # Image URL - from the div-part-image section
+        image_div = part_detail.find('div', class_='div-part-image')
+        if image_div:
+            img_tag = image_div.find('img')
+            if img_tag and img_tag.get('src'):
+                img_src = img_tag['src']
+                data['image_url'] = urllib.parse.urljoin("https://www.autohausaz.com", img_src)
+
+        # Vehicle applications - from aggregatedapplicationinfo div
+        app_info_div = part_detail.find('div', id='aggregatedapplicationinfo')
+        if app_info_div:
+            vehicles_text = app_info_div.get_text(strip=True)
+            if vehicles_text:
+                data['specifications'] = {'Compatible Vehicles': vehicles_text}
+
+        # Extract part number from partnotes section as backup
+        if not data['part_number']:
+            partnotes_div = part_detail.find('div', id='partnotes')
+            if partnotes_div:
+                # Look for P/N: in description
+                descriptions = partnotes_div.find_all('div', class_='description')
+                for desc in descriptions:
+                    desc_text = desc.get_text(strip=True)
+                    if desc_text.startswith('P/N:'):
+                        # Extract part number after "P/N:"
+                        pn_match = re.search(r'P/N:\s*(\S+)', desc_text)
+                        if pn_match:
+                            data['part_number'] = pn_match.group(1)
+                            break
+
+        # Extract manufacturer from product name or partnotes
+        if data['product_name']:
+            if 'Genuine Mercedes' in data['product_name']:
+                data['manufacturer'] = 'Mercedes-Benz'
+            elif 'BMW' in data['product_name']:
+                data['manufacturer'] = 'BMW'
+            elif 'Audi' in data['product_name']:
+                data['manufacturer'] = 'Audi'
+            elif 'Volkswagen' in data['product_name'] or 'VW' in data['product_name']:
+                data['manufacturer'] = 'Volkswagen'
+        
+        # Also check partnotes for manufacturer info
+        if not data['manufacturer']:
+            partnotes_div = part_detail.find('div', id='partnotes')
+            if partnotes_div:
+                partnotes_text = partnotes_div.get_text()
+                if 'Genuine Mercedes' in partnotes_text:
+                    data['manufacturer'] = 'Mercedes-Benz'
+                elif 'BMW' in partnotes_text:
+                    data['manufacturer'] = 'BMW'
+                elif 'Audi' in partnotes_text:
+                    data['manufacturer'] = 'Audi'
+                elif 'Volkswagen' in partnotes_text or 'VW' in partnotes_text:
+                    data['manufacturer'] = 'Volkswagen'
+
+        # Extract cross references/OEM numbers
+        partnumbers_div = part_detail.find('div', id='partnumbers')
+        if partnumbers_div:
+            crossrefs_ul = partnumbers_div.find('ul', class_='crossrefs')
+            if crossrefs_ul:
+                crossref_items = crossrefs_ul.find_all('li')
+                oem_numbers = []
+                for item in crossref_items:
+                    oem_text = item.get_text(strip=True)
+                    if oem_text:
+                        oem_numbers.append(oem_text)
+                if oem_numbers:
+                    data['oem_numbers'] = oem_numbers
+
+        # Clean up empty lists and dicts
+        if not data['oem_numbers']: 
+            data['oem_numbers'] = None
+        if not data['specifications']: 
+            data['specifications'] = None
+
+        # Determine Success
+        if data['product_name'] and data['price'] is not None:
+            data['status'] = 'success'
+            logger.info(f"[AutohausAZ] Successfully parsed: {url}. PN={data['part_number']}, Price={data['price']}")
+            data.pop('error_reason', None)
+        else:
+            missing = []
+            if not data['product_name']: missing.append('product_name')
+            if data['price'] is None: missing.append('price')
+            data['error_reason'] = f"Missing essential fields: {', '.join(missing)}"
+            logger.warning(f"[AutohausAZ] Failed to parse essential info from {url}. Reason: {data['error_reason']}")
+
+        return data
+
+    except Exception as e:
+        logger.exception(f"[AutohausAZ] Unexpected error parsing product page {url}: {e}")
+        data['status'] = 'error'
+        data['error_reason'] = f"Parsing Exception: {type(e).__name__} - {str(e)[:100]}"
+        return data
+
 # --- Vendor Configuration ---
 # Define vendor-specific search and parsing logic
 
@@ -589,10 +819,10 @@ def parse_fcpeuro_product_page(html_content: str, url: str) -> Optional[Dict[str
 
 VENDOR_CONFIG = {
     "pelicanparts.com": {
-        "search_url_template": "https://www.pelicanparts.com/catalog/SuperCat/{part_number}_catalog.htm", # Might need adjustment
+        "search_url_template": "https://www.pelicanparts.com/catalog/SuperCat/{part_number}_catalog.htm",
         "search_method": "GET",
         "product_page_parser": parse_pelican_parts_product_page, 
-        "search_results_parser": None # TBD if needed
+        "search_results_parser": None
     },
     "rockauto.com": {
         "search_url_template": "https://www.rockauto.com/en/partsearch/?partnum={part_number}",
@@ -600,32 +830,30 @@ VENDOR_CONFIG = {
         "product_page_parser": parse_rockauto_product_page, 
         "search_results_parser": extract_rockauto_product_links
     },
-    # Add other vendors: fcpeuro.com, autohausaz.com, ecstuning.com, partsgeek.com
     "fcpeuro.com": {
-        "search_url_template": "https://www.fcpeuro.com/products?keywords={part_number}", # Example
+        "search_url_template": "https://www.fcpeuro.com/products?keywords={part_number}",
         "search_method": "GET",
-        "product_page_parser": parse_fcpeuro_product_page, # Updated
-        "search_results_parser": extract_fcpeuro_product_links # Updated
+        "product_page_parser": parse_fcpeuro_product_page,
+        "search_results_parser": extract_fcpeuro_product_links
     },
      "autohausaz.com": {
-        "search_url_template": "https://www.autohausaz.com/catalog?q={part_number}", # Example
+        "search_url_template": "https://www.autohausaz.com/catalog?k={part_number}&page=1&sortby=r",
         "search_method": "GET",
-        "product_page_parser": None, 
-        "search_results_parser": None
+        "product_page_parser": parse_autohausaz_product_page,
+        "search_results_parser": extract_autohausaz_product_links
     },
      "ecstuning.com": {
-        "search_url_template": "https://www.ecstuning.com/Search/SiteSearch/{part_number}/", # Example
+        "search_url_template": "https://www.ecstuning.com/Search/SiteSearch/{part_number}/",
         "search_method": "GET",
         "product_page_parser": None, 
         "search_results_parser": None
     },
      "partsgeek.com": {
-        "search_url_template": "https://www.partsgeek.com/catalog/{year}/{make}/{model}/{part_description}.html?find={part_number}", # Complex example, needs vehicle context
+        "search_url_template": "https://www.partsgeek.com/catalog/{year}/{make}/{model}/{part_description}.html?find={part_number}",
         "search_method": "GET",
         "product_page_parser": None, 
         "search_results_parser": None
-    },
-    
+    }
 }
 
 # --- NEW: Vendor Processing Logic --- (Modified)
@@ -690,10 +918,10 @@ async def search_and_extract_vendor_data(
         # Return the failure stub contained within scrape_result if scrape failed
         # Ensure create_failure_stub is used within scrape_with_httpx on failure
         if isinstance(scrape_result, dict) and scrape_result.get('status') == 'failed':
-             return [scrape_result] # Return the failure stub directly
+            return [scrape_result] # Return the failure stub directly
         else:
-             # Create a generic one if scrape_result structure is wrong
-             return [create_failure_stub(original_search_url, f"Failed to scrape vendor search URL ({scrape_result.get('error_reason', 'Unknown')})", vendor)]
+            # Create a generic one if scrape_result structure is wrong
+            return [create_failure_stub(original_search_url, f"Failed to scrape vendor search URL ({scrape_result.get('error_reason', 'Unknown')})", vendor)]
         
     initial_html_content = scrape_result["content"]
     actual_initial_url = scrape_result["original_url"] 
@@ -704,13 +932,13 @@ async def search_and_extract_vendor_data(
     
     if link_extractor:
         logger.debug(f"[{vendor}] Attempting link extraction using {link_extractor.__name__}")
-        try: 
+        try:
             product_links = link_extractor(initial_html_content, actual_initial_url)
             # --- Debug Log --- 
             logger.debug(f"[{vendor}] Link extractor found {len(product_links)} links.")
             if product_links:
-                 logger.debug(f"[{vendor}] First few extracted links: {product_links[:3]}")
-        except Exception as e: 
+                logger.debug(f"[{vendor}] First few extracted links: {product_links[:3]}")
+        except Exception as e:
             logger.error(f"[{vendor}] Error executing link extractor: {e}", exc_info=True)
             product_links = []
             
@@ -738,9 +966,9 @@ async def search_and_extract_vendor_data(
             # Flatten results (ensure helper returns list)
             for options_list in results_from_links: 
                 if isinstance(options_list, list):
-                     found_options_list.extend(options_list)
+                    found_options_list.extend(options_list)
                 else:
-                     logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list: {type(options_list)}")
+                    logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list: {type(options_list)}")
                 
         # --- Logic for OTHER Vendors: Process ALL links for FCP Euro as well ---
         elif vendor == "fcpeuro.com":
@@ -781,9 +1009,9 @@ async def search_and_extract_vendor_data(
             logger.info(f"Finished processing vendor {vendor} via product link(s). Returning {len(found_options_list)} options/stubs.")
             return found_options_list
         else:
-             logger.warning(f"Processed product links for {vendor}, but no valid options/stubs were generated.")
-             found_options_list.append(create_failure_stub(actual_initial_url, "Product link(s) found, but processing/parsing failed for all.", vendor))
-             return found_options_list
+            logger.warning(f"Processed product links for {vendor}, but no valid options/stubs were generated.")
+            found_options_list.append(create_failure_stub(actual_initial_url, "Product link(s) found, but processing/parsing failed for all.", vendor))
+            return found_options_list
 
     # --- Strategy 2: Fallback to LLM on original search results page --- 
     else: # No product links found by extractor (or no extractor defined)
@@ -793,11 +1021,12 @@ async def search_and_extract_vendor_data(
             original_description=part_description, original_part_number=part_number
         )
         if llm_fallback_data:
-             if not llm_fallback_data.get("vendor"): llm_fallback_data["vendor"] = vendor.split('.')[0].capitalize()
-             llm_fallback_data["source_url"] = actual_initial_url
-             found_options_list.append(llm_fallback_data)
-        else:
-             found_options_list.append(create_failure_stub(actual_initial_url, "Link extraction failed AND LLM fallback failed", vendor))
+            if not llm_fallback_data.get("vendor"): 
+                llm_fallback_data["vendor"] = vendor.split('.')[0].capitalize()
+            llm_fallback_data["source_url"] = actual_initial_url
+            found_options_list.append(llm_fallback_data)
+        else: 
+            found_options_list.append(create_failure_stub(actual_initial_url, "Link extraction failed AND LLM fallback failed", vendor))
 
     logger.info(f"[{vendor}] Finished processing. Found {len(found_options_list)} total option(s)/stub(s).")
     return found_options_list
@@ -829,19 +1058,20 @@ async def scrape_and_parse_product_page(
                 logger.error(f"Error executing parser {product_page_parser.__name__} for {vendor} on {actual_product_url}: {e}", exc_info=True)
         
         if not options_found: # Use LLM only if static parser failed/didn't exist/returned empty
-             logger.info(f"Static parse failed/N/A for {vendor} on {actual_product_url}. Using LLM.")
-             llm_product_data = await call_llm_for_extraction_from_content(
-                 page_content=product_html_content, url=actual_product_url,
-                 original_description=part_description, original_part_number=part_number
-             )
-             if llm_product_data:
-                  if not llm_product_data.get("vendor"): llm_product_data["vendor"] = vendor.split('.')[0].capitalize()
-                  llm_product_data["source_url"] = actual_product_url
-                  options_found.append(llm_product_data)
-             else:
-                  options_found.append(create_failure_stub(actual_product_url, "Static parse and LLM extraction failed on product page", vendor))
+            logger.info(f"Static parse failed/N/A for {vendor} on {actual_product_url}. Using LLM.")
+            llm_product_data = await call_llm_for_extraction_from_content(
+                page_content=product_html_content, url=actual_product_url,
+                original_description=part_description, original_part_number=part_number
+            )
+            if llm_product_data:
+                if not llm_product_data.get("vendor"): 
+                    llm_product_data["vendor"] = vendor.split('.')[0].capitalize()
+                llm_product_data["source_url"] = actual_product_url
+                options_found.append(llm_product_data)
+            else:
+                options_found.append(create_failure_stub(actual_product_url, "Static parse and LLM extraction failed on product page", vendor))
     else:
-         options_found.append(create_failure_stub(product_url, f"Failed to scrape product page ({product_scrape_result.get('error_reason', 'Unknown')})", vendor))
+        options_found.append(create_failure_stub(product_url, f"Failed to scrape product page ({product_scrape_result.get('error_reason', 'Unknown')})", vendor))
     return options_found
 
 # --- Main Workflow Function (Refactored) --- 
@@ -855,7 +1085,7 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
     4. Aggregates results, validates part numbers, compares prices.
     """
     results = []
-    
+
     for part in parts_to_research:
         part_description = part.get('description')
         part_number = part.get('part_number') # Original part number
@@ -925,33 +1155,33 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
         # --- Post-process results: Validate Part Number etc. --- 
         final_options_by_vendor = {} # Initialize as a dictionary
         for option in all_vendor_options:
-             # Ensure it's a dictionary before processing
-             if not isinstance(option, dict):
-                 logger.error(f"[POST-PROCESS] Skipping non-dict item found in all_vendor_options: {type(option)} - {str(option)[:100]}")
-                 continue 
+            # Ensure it's a dictionary before processing
+            if not isinstance(option, dict):
+                logger.error(f"[POST-PROCESS] Skipping non-dict item found in all_vendor_options: {type(option)} - {str(option)[:100]}")
+                continue 
             
-             vendor_name = option.get('vendor')
-             if not vendor_name:
-                 logger.warning(f"Option from {option.get('source_url', 'Unknown URL')} is missing vendor name, defaulting to 'Unknown'. Option: {str(option)[:100]}")
-                 vendor_name = "Unknown" # Fallback vendor name
+            vendor_name = option.get('vendor')
+            if not vendor_name:
+                logger.warning(f"Option from {option.get('source_url', 'Unknown URL')} is missing vendor name, defaulting to 'Unknown'. Option: {str(option)[:100]}")
+                vendor_name = "Unknown" # Fallback vendor name
 
-             if option.get('status') == 'success':
+            if option.get('status') == 'success':
                 extracted_pn = option.get('part_number')
                 extracted_oem_list = option.get('oem_numbers')
                 validated = True
                 if part_number and extracted_pn:
-                     if not part_numbers_match(part_number, extracted_pn):
-                         normalized_original_pn = normalize_part_number(part_number)
-                         if isinstance(extracted_oem_list, list) and normalized_original_pn in extracted_oem_list:
-                              logger.info(f"Primary PN mismatch for '{part_description}' from {vendor_name}, but original PN '{part_number}' found in extracted OEM list ({extracted_oem_list}). Accepting option.")
-                         else:
-                              logger.warning(f"Part number mismatch for '{part_description}' from {vendor_name}. Original: '{part_number}', Extracted: '{extracted_pn}'. Extracted OEMs: {extracted_oem_list}. Discarding option.")
-                              validated = False 
+                    if not part_numbers_match(part_number, extracted_pn):
+                        normalized_original_pn = normalize_part_number(part_number)
+                        if isinstance(extracted_oem_list, list) and normalized_original_pn in extracted_oem_list:
+                            logger.info(f"Primary PN mismatch for '{part_description}' from {vendor_name}, but original PN '{part_number}' found in extracted OEM list ({extracted_oem_list}). Accepting option.")
+                        else:
+                            logger.warning(f"Part number mismatch for '{part_description}' from {vendor_name}. Original: '{part_number}', Extracted: '{extracted_pn}'. Extracted OEMs: {extracted_oem_list}. Discarding option.")
+                            validated = False 
                 elif part_number and not extracted_pn:
-                     logger.debug(f"Could not extract primary part number from {vendor_name} ({option.get('source_url')}) for validation against original PN '{part_number}'. Keeping option for now, but validation is incomplete.")
-                
+                    logger.debug(f"Could not extract primary part number from {vendor_name} ({option.get('source_url')}) for validation against original PN '{part_number}'. Keeping option for now, but validation is incomplete.")
+
                 if not validated:
-                     continue 
+                    continue 
 
                 found_price = option.get('price')
                 option['price_comparison_status'] = "unknown"
@@ -959,13 +1189,16 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
                 if isinstance(found_price, (int, float)) and isinstance(original_price, (int, float)):
                     difference = round(found_price - original_price, 2)
                     option['price_difference'] = difference
-                    if difference < 0: option['price_comparison_status'] = "cheaper"
-                    elif difference > 0: option['price_comparison_status'] = "more_expensive"
-                    else: option['price_comparison_status'] = "same_price"
+                    if difference < 0: 
+                        option['price_comparison_status'] = "cheaper"
+                    elif difference > 0: 
+                        option['price_comparison_status'] = "more_expensive"
+                    else: 
+                        option['price_comparison_status'] = "same_price"
             
-             if vendor_name not in final_options_by_vendor:
-                 final_options_by_vendor[vendor_name] = []
-             final_options_by_vendor[vendor_name].append(option)
+            if vendor_name not in final_options_by_vendor:
+                final_options_by_vendor[vendor_name] = []
+            final_options_by_vendor[vendor_name].append(option)
 
         # Sort options within each vendor's list
         for vendor_key in final_options_by_vendor:
@@ -987,7 +1220,7 @@ async def research_parts_workflow(parts_to_research: List[Dict[str, Any]], http_
             if isinstance(opt, dict) and opt.get('status') == 'success'
         )
         logger.info(f"--- Finished research for: '{part_description}'. Found {total_successful_options} valid options, organized by {len(final_options_by_vendor)} vendors. ---")
-        await asyncio.sleep(2)
+        await asyncio.sleep(2) 
 
     return results
 
