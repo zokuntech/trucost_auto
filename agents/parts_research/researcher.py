@@ -344,7 +344,7 @@ def parse_autohausaz_product_page(html_content: str, url: str) -> Optional[Dict[
                 descriptions = partnotes_div.find_all('div', class_='description')
                 for desc in descriptions:
                     desc_text = desc.get_text(strip=True)
-                    if desc_text.startswith('P/N:'):
+                    if desc_text.startswith('P/N:'): 
                         # Extract part number after "P/N:"
                         pn_match = re.search(r'P/N:\s*(\S+)', desc_text)
                         if pn_match:
