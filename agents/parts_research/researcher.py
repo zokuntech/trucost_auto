@@ -817,6 +817,186 @@ def parse_fcpeuro_product_page(html_content: str, url: str) -> Optional[Dict[str
         data['error_reason'] = f"Parsing Exception: {type(e).__name__} - {str(e)[:100]}"
         return data
 
+# --- ECS Tuning Parsers ---
+def extract_ecstuning_product_links(html_content: str, url: str) -> List[str]:
+    """Parses ECS Tuning search results to find product links."""
+    logger.info(f"[ECS Tuning] Attempting to extract product links from {url}")
+    if not html_content:
+        logger.warning(f"[ECS Tuning] No HTML content provided for link extraction from {url}")
+        return []
+
+    soup = BeautifulSoup(html_content, 'lxml')
+    product_links = []
+    base_url = "https://www.ecstuning.com"
+
+    # Products are in <div class="productListBox"> containers
+    product_boxes = soup.find_all('div', class_='productListBox')
+
+    if not product_boxes:
+        logger.warning(f"[ECS Tuning] No 'div.productListBox' elements found on {url}. Link extraction might fail or page structure may have changed.")
+        return []
+
+    for box in product_boxes:
+        # Look for the main product link in productListInfo section
+        product_info = box.find('div', class_='productListInfo')
+        if product_info:
+            link_tag = product_info.find('a', href=True)
+            if link_tag and link_tag.get('href'):
+                href = link_tag['href']
+                # Ensure the URL is absolute
+                absolute_url = urllib.parse.urljoin(base_url, href)
+                product_links.append(absolute_url)
+            else:
+                logger.debug(f"[ECS Tuning] Found productListInfo but no link in a product box on {url}")
+        else:
+            logger.debug(f"[ECS Tuning] Found productListBox without productListInfo on {url}")
+
+    unique_links = list(dict.fromkeys(product_links)) # Deduplicate while preserving order
+    if unique_links:
+        logger.info(f"[ECS Tuning] Extracted {len(unique_links)} unique product links from {url}")
+        logger.debug(f"[ECS Tuning] First few links: {unique_links[:3]}")
+    else:
+        logger.warning(f"[ECS Tuning] Link extraction complete, but no product links were found on {url}")
+        
+    return unique_links
+
+def parse_ecstuning_product_page(html_content: str, url: str) -> Optional[Dict[str, Any]]:
+    """Parses an ECS Tuning product page to extract product details."""
+    logger.info(f"[ECS Tuning] Attempting to parse product page: {url}")
+    if not html_content:
+        logger.warning(f"[ECS Tuning] No HTML content for product page parse: {url}")
+        return create_failure_stub(url, "No HTML Content", "ECS Tuning")
+
+    soup = BeautifulSoup(html_content, 'lxml')
+    data = {
+        'status': 'error',
+        'source_url': url,
+        'vendor': 'ECS Tuning',
+        'product_name': None,
+        'part_number': None,
+        'manufacturer': None,
+        'price': None,
+        'currency': None,
+        'availability': 'Unknown',
+        'image_url': None,
+        'oem_numbers': [],
+        'specifications': {},
+        'error_reason': None
+    }
+
+    try:
+        # Product Name - from h1.producttitle
+        title_tag = soup.find('h1', class_='producttitle')
+        if title_tag:
+            data['product_name'] = title_tag.get_text(strip=True)
+
+        # Price - look for span#price or .priceproduct
+        price_element = soup.find('span', id='price') or soup.find('span', class_='priceproduct')
+        if price_element:
+            price_text = price_element.get_text(strip=True)
+            price_match = re.search(r'([\d,]+\.?\d*)', price_text)
+            if price_match:
+                try:
+                    data['price'] = float(price_match.group(1).replace(',', ''))
+                    data['currency'] = 'USD'
+                except ValueError:
+                    logger.warning(f"[ECS Tuning] Could not convert price '{price_match.group(1)}' to float on {url}")
+
+        # Manufacturer Part Number - look for span with itemprop="mpn"
+        mpn_element = soup.find('span', {'itemprop': 'mpn'})
+        if mpn_element:
+            data['part_number'] = mpn_element.get_text(strip=True)
+
+        # ECS Part Number - look for span.esnum
+        ecs_element = soup.find('span', class_='esnum')
+        if ecs_element:
+            ecs_number = ecs_element.get_text(strip=True)
+            if not data['specifications']:
+                data['specifications'] = {}
+            data['specifications']['ECS Number'] = f"ES#{ecs_number}"
+
+        # Manufacturer/Brand - look for meta with itemprop="brand" or brand link
+        brand_meta = soup.find('meta', {'itemprop': 'brand'})
+        if brand_meta and brand_meta.get('content'):
+            data['manufacturer'] = brand_meta['content']
+        else:
+            # Fallback: look for brand link or image
+            brand_link = soup.find('a', id='brandLink')
+            if brand_link:
+                brand_img = brand_link.find('img')
+                if brand_img and brand_img.get('alt'):
+                    data['manufacturer'] = brand_img['alt']
+
+        # Availability - look for fulfillment section
+        availability_element = soup.find('dd', class_='PreOrder')
+        if availability_element:
+            availability_text = availability_element.get_text(strip=True)
+            data['availability'] = availability_text
+        else:
+            # Check for in-stock indicators
+            stock_element = soup.find('link', {'itemprop': 'availability'})
+            if stock_element and stock_element.get('href'):
+                if 'InStock' in stock_element['href']:
+                    data['availability'] = 'In Stock'
+
+        # Image URL - look for main product image
+        img_element = soup.find('img', id='placeholder')
+        if img_element and img_element.get('src'):
+            img_src = img_element['src']
+            data['image_url'] = urllib.parse.urljoin(url, img_src)
+
+        # Product description - look for productdesc1
+        desc_element = soup.find('div', class_='productdesc1')
+        if desc_element:
+            desc_text = desc_element.get_text(strip=True)
+            if desc_text and desc_text != data['product_name']:
+                if not data['specifications']:
+                    data['specifications'] = {}
+                data['specifications']['Description'] = desc_text
+
+        # Cross Reference numbers - look for cross-ref-definition
+        cross_ref_element = soup.find('dd', class_='cross-ref-definition')
+        if cross_ref_element:
+            cross_ref_items = cross_ref_element.find_all('li')
+            if cross_ref_items:
+                cross_refs = [item.get_text(strip=True) for item in cross_ref_items]
+                data['oem_numbers'] = cross_refs
+
+        # Additional product details from long description
+        long_desc_element = soup.find('div', class_='productlongdesc')
+        if long_desc_element:
+            long_desc_text = long_desc_element.get_text(strip=True)
+            if long_desc_text:
+                if not data['specifications']:
+                    data['specifications'] = {}
+                data['specifications']['Long Description'] = long_desc_text[:500]  # Truncate if too long
+
+        # Clean up empty lists and dicts
+        if not data['oem_numbers']: 
+            data['oem_numbers'] = None
+        if not data['specifications']: 
+            data['specifications'] = None
+
+        # Determine Success
+        if data['product_name'] and data['price'] is not None:
+            data['status'] = 'success'
+            logger.info(f"[ECS Tuning] Successfully parsed: {url}. PN={data['part_number']}, Price={data['price']}")
+            data.pop('error_reason', None)
+        else:
+            missing = []
+            if not data['product_name']: missing.append('product_name')
+            if data['price'] is None: missing.append('price')
+            data['error_reason'] = f"Missing essential fields: {', '.join(missing)}"
+            logger.warning(f"[ECS Tuning] Failed to parse essential info from {url}. Reason: {data['error_reason']}")
+
+        return data
+
+    except Exception as e:
+        logger.exception(f"[ECS Tuning] Unexpected error parsing product page {url}: {e}")
+        data['status'] = 'error'
+        data['error_reason'] = f"Parsing Exception: {type(e).__name__} - {str(e)[:100]}"
+        return data
+
 VENDOR_CONFIG = {
     "pelicanparts.com": {
         "search_url_template": "https://www.pelicanparts.com/catalog/SuperCat/{part_number}_catalog.htm",
@@ -845,8 +1025,8 @@ VENDOR_CONFIG = {
      "ecstuning.com": {
         "search_url_template": "https://www.ecstuning.com/Search/SiteSearch/{part_number}/",
         "search_method": "GET",
-        "product_page_parser": None, 
-        "search_results_parser": None
+        "product_page_parser": parse_ecstuning_product_page,
+        "search_results_parser": extract_ecstuning_product_links
     },
      "partsgeek.com": {
         "search_url_template": "https://www.partsgeek.com/catalog/{year}/{make}/{model}/{part_description}.html?find={part_number}",
@@ -889,7 +1069,12 @@ async def search_and_extract_vendor_data(
 
     # --- Construct and Scrape Initial Search URL ---
     try:
-        encoded_part_number = urllib.parse.quote_plus(part_number)
+        # Handle ECS Tuning differently - they don't like + encoding
+        if vendor == "ecstuning.com":
+            encoded_part_number = urllib.parse.quote(part_number, safe='')
+        else:
+            encoded_part_number = urllib.parse.quote_plus(part_number)
+            
         format_args = {"part_number": encoded_part_number}
         if '{year}' in search_url_template: format_args['year'] = vehicle_info.get('year', 'any')
         if '{make}' in search_url_template: format_args['make'] = vehicle_info.get('make', 'any')
@@ -970,7 +1155,7 @@ async def search_and_extract_vendor_data(
                 else:
                     logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list: {type(options_list)}")
                 
-        # --- Logic for OTHER Vendors: Process ALL links for FCP Euro as well ---
+        # --- Logic for OTHER Vendors: Process ALL links for FCP Euro and ECS Tuning as well ---
         elif vendor == "fcpeuro.com":
             logger.info(f"[{vendor}] Entering FCP Euro specific block to process {len(product_links)} links.")
             link_tasks = []
@@ -990,6 +1175,26 @@ async def search_and_extract_vendor_data(
                     found_options_list.extend(options_list_item)
                 else:
                     logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list for an FCP Euro link: {type(options_list_item)}")
+        
+        elif vendor == "ecstuning.com":
+            logger.info(f"[{vendor}] Entering ECS Tuning specific block to process {len(product_links)} links.")
+            link_tasks = []
+            for product_url in product_links:
+                link_tasks.append(scrape_and_parse_product_page(
+                    product_url=product_url, vendor=vendor, config=config,
+                    part_description=part_description, part_number=part_number,
+                    http_client=http_client
+                ))
+            
+            logger.debug(f"[{vendor}] Gathering results for {len(link_tasks)} ECS Tuning link processing tasks...")
+            results_from_links = await asyncio.gather(*link_tasks)
+            logger.debug(f"[{vendor}] Gathered results from ECS Tuning link processing.")
+            
+            for options_list_item in results_from_links:
+                if isinstance(options_list_item, list):
+                    found_options_list.extend(options_list_item)
+                else:
+                    logger.error(f"[{vendor}] scrape_and_parse_product_page helper returned non-list for an ECS Tuning link: {type(options_list_item)}")
         else:
             # Original logic for other vendors: process only the first link
             if product_links: # Ensure there is at least one link
